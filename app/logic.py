@@ -1,77 +1,103 @@
-import random
+import requests
 
+# CONFIG
+RULES_CONFIG = {
+    "high_amount": {"threshold": 1000, "weight": 0.4},
+    "foreign_tx": {"allowed_country": "MX", "weight": 0.2},
+    "velocity": {"min_tx": 3, "weight": 0.3},
+}
 
-def analyze_transaction(tx):
+# -------- IP API --------
+def get_ip_risk(ip):
+    try:
+        res = requests.get(f"http://ip-api.com/json/{ip}")
+        data = res.json()
 
-    risk_score = 0.0
-    reason = []
+        risk = 0
+        reasons = []
 
-    # 🔹 Regla 1: monto alto
-    if tx.amount > 3000:
-        risk_score += 0.4
-        reason.append("High amount")
+        if data.get("proxy", False):
+            risk += 0.4
+            reasons.append("Proxy/VPN detected")
 
-    # 🔹 Regla 2: tokenización
-    if not tx.tokenized:
-        risk_score += 0.3
-        reason.append("Non-tokenized transaction")
-    else:
-        risk_score -= 0.1
-        reason.append("Tokenized (lower risk)")
+        if data.get("countryCode", "MX") != "MX":
+            risk += 0.2
+            reasons.append("Foreign IP")
 
-    # 🔹 Regla 3: país
-    if tx.country not in ["MX", "US", "CA"]:
-        risk_score += 0.3
-        reason.append("Foreign transaction")
+        return risk, reasons
+    except:
+        return 0, []
 
-    # 🔹 Regla 4: merchant risk
-    high_risk_merchants = ["CASINO", "BET", "CRYPTO"]
-    if tx.merchant.upper() in high_risk_merchants:
-        risk_score += 0.4
-        reason.append("High risk merchant")
+# -------- BIN API --------
+def get_bin_risk(bin_number):
+    try:
+        res = requests.get(f"https://lookup.binlist.net/{bin_number}")
+        data = res.json()
 
-    # 🔹 Evitar score negativo
-    if risk_score < 0:
-        risk_score = 0
+        risk = 0
+        reasons = []
 
-    # 🔥 NUEVO: simulación de errores tipo issuer
-    error_chance = random.random()
+        country = data.get("country", {}).get("alpha2")
 
-    if error_chance < 0.15:
-        return {
-            "error": "NO_RESPONSE_FROM_ISSUER",
-            "message": "Issuer did not respond in time",
-            "response_code": "91"
-        }
+        if country and country != "MX":
+            risk += 0.3
+            reasons.append("Foreign card")
 
-    elif error_chance < 0.25:
-        return {
-            "error": "ISSUER_TIMEOUT",
-            "message": "Authorization timeout",
-            "response_code": "68"
-        }
+        return risk, reasons
+    except:
+        return 0, []
 
-    elif error_chance < 0.30:
-        return {
-            "error": "SYSTEM_ERROR",
-            "message": "Internal server error",
-            "response_code": "96"
-        }
+# -------- MOTOR --------
+def analyze_transaction(tx, history=[]):
 
-    # 🔹 Decisión normal
-    if risk_score < 0.3:
-        decision = "APPROVE"
-        code = "00"
-    elif risk_score < 0.7:
+    score = 0
+    reasons = []
+
+    amount = tx.amount
+    merchant = tx.merchant.upper()
+    country = tx.country
+
+    if amount > RULES_CONFIG["high_amount"]["threshold"]:
+        score += RULES_CONFIG["high_amount"]["weight"]
+        reasons.append("High amount")
+
+    if country != RULES_CONFIG["foreign_tx"]["allowed_country"]:
+        score += RULES_CONFIG["foreign_tx"]["weight"]
+        reasons.append("Foreign transaction")
+
+    if len(history[-5:]) >= RULES_CONFIG["velocity"]["min_tx"]:
+        score += RULES_CONFIG["velocity"]["weight"]
+        reasons.append("High velocity")
+
+    # IP API
+    ip = getattr(tx, "ip", "8.8.8.8")
+    ip_score, ip_reasons = get_ip_risk(ip)
+
+    score += ip_score
+    reasons.extend(ip_reasons)
+
+    # BIN API
+    fake_bin = "45717360"
+    bin_score, bin_reasons = get_bin_risk(fake_bin)
+
+    score += bin_score
+    reasons.extend(bin_reasons)
+
+    score = min(score, 1.0)
+
+    if score >= 0.75:
+        decision = "DECLINE"
+        code = "05"
+    elif score >= 0.45:
         decision = "REVIEW"
         code = "10"
     else:
-        decision = "DECLINE"
-        code = "05"
+        decision = "APPROVE"
+        code = "00"
 
     return {
         "decision": decision,
+        "risk_score": round(score, 2),
         "response_code": code,
-        "risk_score": round(risk_score, 2),
-        "reason": reason
+        "reason": reasons
     }
